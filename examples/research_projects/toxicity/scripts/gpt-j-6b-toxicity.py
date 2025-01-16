@@ -1,4 +1,4 @@
-# Copyright 2025 The HuggingFace Team. All rights reserved.
+# Copyright 2024 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -68,8 +68,8 @@ class ScriptArguments:
     model_name: Optional[str] = field(default="ybelkada/gpt-j-6b-sharded-bf16", metadata={"help": "the model name"})
     log_with: Optional[str] = field(default=None, metadata={"help": "use 'wandb' to log with wandb"})
     learning_rate: Optional[float] = field(default=(1.47e-5) * 2, metadata={"help": "the learning rate"})
-    mini_batch_size: Optional[int] = field(default=4, metadata={"help": "the PPO minibatch size"})
-    batch_size: Optional[int] = field(default=16, metadata={"help": "the batch size"})
+    mini_batch_size: Optional[int] = field(default=1, metadata={"help": "the PPO minibatch size"})
+    batch_size: Optional[int] = field(default=1, metadata={"help": "the batch size"})
     gradient_accumulation_steps: Optional[int] = field(
         default=1, metadata={"help": "the number of gradient accumulation steps"}
     )
@@ -78,12 +78,21 @@ class ScriptArguments:
         metadata={"help": "the path to save the model"},
     )
 
+# torch.cuda.empty_cache()
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
 
+model_id = "/dccstor/arnaik_data/routing/data/llama-3.1-8B-converted"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+# model = AutoModelForCausalLM.from_pretrained(model_id) 
+model = AutoModelForCausalLMWithValueHead.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
+
+
+print(model)
+
 config = PPOConfig(
-    model_name=script_args.model_name,
+    model_name=model,
     learning_rate=script_args.learning_rate,
     log_with=script_args.log_with,
     ppo_epochs=100,
@@ -111,7 +120,10 @@ def build_dataset(
         dataloader (`torch.utils.data.DataLoader`):
             The dataloader for the dataset.
     """
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    # tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    # tokenizer.pad_token = tokenizer.eos_token
+    model_id = "/dccstor/arnaik_data/routing/data/llama-3.1-8B-converted"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.pad_token = tokenizer.eos_token
 
     ds = load_dataset(dataset_name, split="train")
@@ -155,9 +167,16 @@ set_seed(config.seed)
 
 # Now let's build the model, the reference model, and the tokenizer. We first load the model
 # in bfloat16 to save memory using `transformers`.
-model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch.bfloat16)
-# And then we pass the loaded model to `AutoModelForCausalLMWithValueHead`.
-model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
+# model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch.bfloat16)
+# # And then we pass the loaded model to `AutoModelForCausalLMWithValueHead`.
+# model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
+
+model_id = "/dccstor/arnaik_data/routing/data/llama-3.1-8B-converted"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer.pad_token = tokenizer.eos_token
+# model = AutoModelForCausalLMWithValueHead.from_pretrained(model_id) 
+
+model = AutoModelForCausalLMWithValueHead.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
 
 # We create a reference model by sharing 20 layers
 ref_model = create_reference_model(model, num_shared_layers=20)
@@ -167,7 +186,9 @@ optimizer = Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=confi
 
 # GPT-2 / GPT-J tokenizer has a pad token, but it is not eos_token by default. We need to set it to eos_token.
 # only for this model.
-tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+model_id = "/dccstor/arnaik_data/routing/data/llama-3.1-8B-converted"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+ 
 tokenizer.pad_token = tokenizer.eos_token
 
 # We then build the PPOTrainer, passing the model, the reference model, the tokenizer
@@ -183,12 +204,23 @@ ppo_trainer = PPOTrainer(
 
 # We then build the reward pipeline, we will use the toxicity model to compute the reward.
 # We first load the toxicity model and tokenizer.
+# toxicity_model_id = "facebook/roberta-hate-speech-dynabench-r4-target"
+# toxicity_tokenizer = RobertaTokenizer.from_pretrained(toxicity_model_id)
+# # We load the toxicity model in fp16 to save memory.
+# toxicity_model = RobertaForSequenceClassification.from_pretrained(toxicity_model_id, torch_dtype=torch.float16).to(
+#     ppo_trainer.accelerator.device
+# )
+
+# toxicity_model_id = "/dccstor/arnaik_data/routing/data/llama-3.1-8B-converted"
+# toxicity_tokenizer = AutoTokenizer.from_pretrained(model_id)
+# # model = AutoModelForCausalLMWithValueHead.from_pretrained(model_id) 
+# toxicity_tokenizer.pad_token = tokenizer.eos_token
+# toxicity_model = AutoModelForCausalLMWithValueHead.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
+
 toxicity_model_id = "facebook/roberta-hate-speech-dynabench-r4-target"
 toxicity_tokenizer = RobertaTokenizer.from_pretrained(toxicity_model_id)
 # We load the toxicity model in fp16 to save memory.
-toxicity_model = RobertaForSequenceClassification.from_pretrained(toxicity_model_id, torch_dtype=torch.float16).to(
-    ppo_trainer.accelerator.device
-)
+toxicity_model = RobertaForSequenceClassification.from_pretrained(toxicity_model_id, torch_dtype=torch.float16).to("cpu")
 
 
 # We then define the arguments to pass to the `generate` function. These arguments
@@ -208,31 +240,40 @@ output_length_sampler = LengthSampler(output_min_length, output_max_length)
 model_save_path = script_args.model_save_path
 
 for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
+    print("-----------------------epochs!!")
+    print(epoch, batch, len(batch["input_ids"]))
     query_tensors = batch["input_ids"]
 
     # Get response from the policy model
     response_tensors = []
+    print("len of query tensors", len(query_tensors))
     for query in query_tensors:
         gen_len = output_length_sampler()
         generation_kwargs["max_new_tokens"] = gen_len
+        print("query:", query)
+        # try:
         response = ppo_trainer.generate(query, **generation_kwargs)
+        print(response.squeeze()[-gen_len:])
         response_tensors.append(response.squeeze()[-gen_len:])
+        # except Exception as e:
+        #     print("exception!!", e)
+        #     continue
     batch["response"] = [tokenizer.decode(r.squeeze()) for r in response_tensors]
 
+    print("len of responses in batch", len( batch["response"]))
     # Compute sentiment score
     texts = batch["response"]
-    toxicity_inputs = toxicity_tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(
-        ppo_trainer.accelerator.device
-    )
+    toxicity_inputs = toxicity_tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+    
     logits = toxicity_model(**toxicity_inputs).logits.float()
     toxicity_labels = (logits[:, 0]).tolist()
-
+    print("toxicity_labels", toxicity_labels)
     rewards = [torch.tensor(output) for output in toxicity_labels]
-
+    print("rewards", rewards)
     # Run PPO step
     stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
     ppo_trainer.log_stats(stats, batch, rewards)
-
+    print("moving on")
     # Save model every 100 epochs
     if epoch % 100 == 0:
         if ppo_trainer.accelerator.is_main_process:
